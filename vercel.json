@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/resolve.py": {
-      "maxDuration": 60
-    }
-  }
-}
