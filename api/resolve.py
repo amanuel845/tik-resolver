@@ -1,11 +1,33 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
+from urllib.parse import urlparse, quote
 import yt_dlp
+import requests
 import os
 
 app = Flask(__name__)
 
 
+ALLOWED_HOSTS = (
+    '.tiktokcdn.com',
+    '.tiktokcdn-us.com',
+    '.tiktok.com',
+    '.tiktokv.com',
+    '.byteoversea.com',
+    '.ibytedtos.com',
+)
+
+BROWSER_HEADERS = {
+    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                   'AppleWebKit/537.36 (KHTML, like Gecko) '
+                   'Chrome/120.0.0.0 Safari/537.36'),
+    'Referer': 'https://www.tiktok.com/',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+
 @app.route('/')
+@app.route('/api/resolve')
 def resolve():
     url = request.args.get('url')
     if not url:
@@ -20,26 +42,15 @@ def resolve():
         'skip_download': True,
         'format': 'best',
         'nocheckcertificate': True,
-        'extractor_args': {
-            'tiktok': {
-                'api_hostname': ['api22-normal-c-useast2a.tiktokv.com'],
-            },
-        },
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
-        return jsonify({
-            'ok': False,
-            'error': 'extraction failed: ' + str(e)
-        }), 502
+        return jsonify({'ok': False, 'error': 'extraction failed: ' + str(e)}), 502
     except Exception as e:
-        return jsonify({
-            'ok': False,
-            'error': 'unexpected error: ' + str(e)
-        }), 500
+        return jsonify({'ok': False, 'error': 'unexpected error: ' + str(e)}), 500
 
     if not info:
         return jsonify({'ok': False, 'error': 'no info returned'}), 502
@@ -48,16 +59,18 @@ def resolve():
     no_watermark = _pick_no_watermark(formats, info)
     watermark = _pick_watermark(formats, info)
 
+    base = request.host_url.rstrip('/')
+
     return jsonify({
         'ok': True,
-        'mode': info.get('extractor_key', 'TikTok').lower().replace('tiktok', 'video') or 'video',
+        'mode': 'video',
         'item': {
             'id': info.get('id', ''),
             'type': 'video',
             'title': info.get('title') or info.get('description') or '',
             'duration': info.get('duration') or 0,
             'author': {
-                'handle': info.get('uploader_id') or info.get('uploader') or '',
+                'handle': info.get('uploader') or info.get('uploader_id') or '',
                 'name': info.get('uploader') or '',
                 'avatar': _pick_thumbnail(info),
             },
@@ -69,9 +82,9 @@ def resolve():
             },
             'cover': _pick_thumbnail(info),
             'video': {
-                'noWatermark': no_watermark,
-                'watermark': watermark,
-                'hd': no_watermark,
+                'noWatermark': _proxy_url(base, no_watermark),
+                'watermark': _proxy_url(base, watermark),
+                'hd': _proxy_url(base, no_watermark),
             },
             'music': {},
             'images': [],
@@ -79,9 +92,72 @@ def resolve():
     })
 
 
+@app.route('/stream')
+def stream():
+    """Proxy a TikTok CDN URL, adding Referer so the CDN accepts the request.
+
+    Only TikTok CDN hosts are allowed, so this can't be abused as an open
+    proxy. Range requests are forwarded so <video> seeking works.
+    """
+    target = request.args.get('url')
+    if not target:
+        return jsonify({'ok': False, 'error': 'missing url'}), 400
+
+    host = urlparse(target).netloc.lower()
+    if not any(host.endswith(h) for h in ALLOWED_HOSTS):
+        return jsonify({'ok': False, 'error': 'host not allowed'}), 403
+
+    headers = dict(BROWSER_HEADERS)
+    # Forward Range header so seeking and partial playback work.
+    if 'Range' in request.headers:
+        headers['Range'] = request.headers['Range']
+
+    try:
+        upstream = requests.get(target, headers=headers, stream=True, timeout=30)
+    except requests.RequestException as e:
+        return jsonify({'ok': False, 'error': 'upstream failed: ' + str(e)}), 502
+
+    # Pass through the status: 200 full, 206 partial, 403/404 error.
+    status = upstream.status_code
+
+    def generate():
+        try:
+            for chunk in upstream.iter_content(chunk_size=65536):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    out_headers = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Range',
+        'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
+        'Accept-Ranges': upstream.headers.get('Accept-Ranges', 'bytes'),
+    }
+    for h in ('Content-Type', 'Content-Length', 'Content-Range'):
+        if h in upstream.headers:
+            out_headers[h] = upstream.headers[h]
+
+    if 'Content-Type' not in out_headers:
+        out_headers['Content-Type'] = 'video/mp4'
+
+    return Response(
+        stream_with_context(generate()),
+        status=status,
+        headers=out_headers,
+    )
+
+
 @app.route('/health')
 def health():
     return jsonify({'ok': True, 'service': 'tik-resolver'})
+
+
+def _proxy_url(base, cdn_url):
+    """Wrap a TikTok CDN URL in our streaming proxy."""
+    if not cdn_url:
+        return ''
+    return base + '/stream?url=' + quote(cdn_url, safe='')
 
 
 def _pick_thumbnail(info):
@@ -92,11 +168,7 @@ def _pick_thumbnail(info):
 
 
 def _pick_no_watermark(formats, info):
-    """
-    yt-dlp for TikTok exposes several format IDs. The ones without
-    'watermark' in their id are the clean copies. Prefer MP4, prefer
-    the highest resolution.
-    """
+    """Prefer MP4 formats whose format_id does not mention 'watermark'."""
     candidates = []
     for f in formats:
         fid = (f.get('format_id') or '').lower()
