@@ -1,25 +1,108 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
-from urllib.parse import quote
+from flask import Flask, request, jsonify
 import yt_dlp
-import tempfile
+import re
 import os
 
 app = Flask(__name__)
 
 
-# ---------- Metadata ----------
 @app.route('/')
+@app.route('/api/classify')
+def classify():
+    url = request.args.get('url')
+    if not url:
+        return jsonify({
+            'ok': False,
+            'error': 'missing url parameter. Usage: /api/classify?url=<tiktok_url>'
+        }), 400
+
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'format': 'best',
+        'nocheckcertificate': True,
+    }
+
+    info = None
+    extract_error = None
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        extract_error = str(e)
+    except Exception as e:
+        extract_error = str(e)
+
+    # Classify based on what yt-dlp tells us.
+    kind = 'unknown'
+    resolved_url = ''
+    live_broadcast = None
+    reason = ''
+
+    if info:
+        resolved_url = info.get('webpage_url') or info.get('url') or ''
+        live_broadcast = info.get('is_live')
+
+        # yt-dlp exposes 'is_live' for live streams. True or None.
+        if live_broadcast is True:
+            kind = 'live'
+            reason = 'yt-dlp reports is_live=true'
+        elif resolved_url and '/live' in resolved_url:
+            kind = 'live'
+            reason = 'resolved URL contains /live'
+        elif info.get('_type') == 'playlist':
+            kind = 'live'
+            reason = 'yt-dlp returned a playlist (live streams often do)'
+        elif resolved_url and '/photo/' in resolved_url:
+            kind = 'photo'
+            reason = 'resolved URL contains /photo/'
+        elif resolved_url and '/video/' in resolved_url:
+            kind = 'video'
+            reason = 'resolved URL contains /video/'
+        elif info.get('ext') in ('mp4', 'webm'):
+            kind = 'video'
+            reason = 'yt-dlp returned an mp4/webm format'
+        else:
+            kind = 'video'
+            reason = 'yt-dlp extracted a single-item result without /live'
+
+    # Fall back to inspecting the input URL for obvious cases.
+    if kind == 'unknown':
+        if re.search(r'/(live|share/live)/', url, re.I):
+            kind = 'live'
+            reason = 'input URL matches live pattern'
+        elif re.search(r'/(video|photo)/\d+', url, re.I):
+            kind = 'video'
+            reason = 'input URL matches video/photo pattern'
+
+    return jsonify({
+        'ok': True,
+        'input': url,
+        'kind': kind,
+        'reason': reason,
+        'resolved_url': resolved_url,
+        'is_live': live_broadcast,
+        'error': extract_error,
+    })
+
+
 @app.route('/api/resolve')
-def resolve():
+def resolve_metadata():
+    """Keep the metadata path — useful for the downloader's cover/stats."""
     url = request.args.get('url')
     if not url:
         return jsonify({'ok': False, 'error': 'missing url parameter'}), 400
 
     ydl_opts = {
-        'quiet': True, 'no_warnings': True,
-        'skip_download': True, 'format': 'best',
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'format': 'best',
         'nocheckcertificate': True,
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -29,7 +112,7 @@ def resolve():
         return jsonify({'ok': False, 'error': 'unexpected error: ' + str(e)}), 500
 
     if not info:
-        return jsonify({'ok': False, 'error': 'no info'}), 502
+        return jsonify({'ok': False, 'error': 'no info returned'}), 502
 
     return jsonify({
         'ok': True,
@@ -58,60 +141,9 @@ def resolve():
     })
 
 
-# ---------- Download (server-side) ----------
-@app.route('/api/download')
-def download():
-    url = request.args.get('url')
-    if not url:
-        return jsonify({'ok': False, 'error': 'missing url parameter'}), 400
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-    tmp_path = tmp.name
-    tmp.close()
-
-    ydl_opts = {
-        'quiet': True, 'no_warnings': True,
-        'outtmpl': tmp_path,
-        'format': 'best[ext=mp4]/best',
-        'nocheckcertificate': True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        try: os.unlink(tmp_path)
-        except OSError: pass
-        return jsonify({'ok': False, 'error': str(e)}), 502
-
-    file_size = os.path.getsize(tmp_path)
-
-    def generate():
-        try:
-            with open(tmp_path, 'rb') as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
-        finally:
-            try: os.unlink(tmp_path)
-            except OSError: pass
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype='video/mp4',
-        headers={
-            'Content-Disposition': 'attachment; filename="tiktok.mp4"',
-            'Content-Length': str(file_size),
-            'Access-Control-Allow-Origin': '*',
-        },
-    )
-
-
 @app.route('/health')
 def health():
-    return jsonify({'ok': True, 'service': 'tik-resolver'})
+    return jsonify({'ok': True, 'service': 'tik-classifier'})
 
 
 def _pick_thumbnail(info):
@@ -122,4 +154,5 @@ def _pick_thumbnail(info):
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
