@@ -25,6 +25,29 @@ BROWSER_HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
+# Module-level session so cookies persist across requests within the
+# same warm serverless invocation.
+_session = requests.Session()
+_session.headers.update(BROWSER_HEADERS)
+
+_cookies_warmed = False
+
+
+def _warm_cookies(force=False):
+    """Visit tiktok.com once to collect the CDN cookies (ttwid, msToken, …).
+
+    Fastly checks the cookie chain in addition to the URL signature.
+    Without these, /stream returns 403 even though the URL itself is valid.
+    """
+    global _cookies_warmed
+    if _cookies_warmed and not force:
+        return
+    try:
+        _session.get('https://www.tiktok.com/', timeout=10, allow_redirects=True)
+        _cookies_warmed = True
+    except requests.RequestException:
+        pass
+
 
 @app.route('/')
 @app.route('/api/resolve')
@@ -94,7 +117,7 @@ def resolve():
 
 @app.route('/stream')
 def stream():
-    """Proxy a TikTok CDN URL, adding Referer so the CDN accepts the request.
+    """Proxy a TikTok CDN URL, adding cookies and Referer so Fastly accepts it.
 
     Only TikTok CDN hosts are allowed, so this can't be abused as an open
     proxy. Range requests are forwarded so <video> seeking works.
@@ -107,17 +130,17 @@ def stream():
     if not any(host.endswith(h) for h in ALLOWED_HOSTS):
         return jsonify({'ok': False, 'error': 'host not allowed'}), 403
 
+    _warm_cookies()
+
     headers = dict(BROWSER_HEADERS)
-    # Forward Range header so seeking and partial playback work.
     if 'Range' in request.headers:
         headers['Range'] = request.headers['Range']
 
     try:
-        upstream = requests.get(target, headers=headers, stream=True, timeout=30)
+        upstream = _session.get(target, headers=headers, stream=True, timeout=30)
     except requests.RequestException as e:
         return jsonify({'ok': False, 'error': 'upstream failed: ' + str(e)}), 502
 
-    # Pass through the status: 200 full, 206 partial, 403/404 error.
     status = upstream.status_code
 
     def generate():
@@ -168,7 +191,6 @@ def _pick_thumbnail(info):
 
 
 def _pick_no_watermark(formats, info):
-    """Prefer MP4 formats whose format_id does not mention 'watermark'."""
     candidates = []
     for f in formats:
         fid = (f.get('format_id') or '').lower()
@@ -190,7 +212,6 @@ def _pick_no_watermark(formats, info):
 
 
 def _pick_watermark(formats, info):
-    """Find the watermarked variant, if yt-dlp exposes one."""
     for f in formats:
         fid = (f.get('format_id') or '').lower()
         if 'watermark' in fid and (f.get('ext') or '').lower() == 'mp4':
