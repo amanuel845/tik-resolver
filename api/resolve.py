@@ -35,17 +35,16 @@ def classify():
     except Exception as e:
         extract_error = str(e)
 
-    # Classify based on what yt-dlp tells us.
     kind = 'unknown'
     resolved_url = ''
     live_broadcast = None
+    live_username = ''
     reason = ''
 
     if info:
         resolved_url = info.get('webpage_url') or info.get('url') or ''
         live_broadcast = info.get('is_live')
 
-        # yt-dlp exposes 'is_live' for live streams. True or None.
         if live_broadcast is True:
             kind = 'live'
             reason = 'yt-dlp reports is_live=true'
@@ -68,6 +67,22 @@ def classify():
             kind = 'video'
             reason = 'yt-dlp extracted a single-item result without /live'
 
+    # Extract the live channel username from the extractor error, when present.
+    if extract_error:
+        err_lower = extract_error.lower()
+
+        m = re.search(r'\[tiktok:live\]\s+([^:]+):', extract_error)
+        if m:
+            live_username = m.group(1).strip()
+
+        if kind == 'unknown' and (
+            'not currently live' in err_lower or
+            '[tiktok:live]' in err_lower or
+            'tiktok:live' in err_lower
+        ):
+            kind = 'live'
+            reason = 'extractor reported a live channel that is offline'
+
     # Fall back to inspecting the input URL for obvious cases.
     if kind == 'unknown':
         if re.search(r'/(live|share/live)/', url, re.I):
@@ -84,13 +99,14 @@ def classify():
         'reason': reason,
         'resolved_url': resolved_url,
         'is_live': live_broadcast,
+        'live_username': live_username,
         'error': extract_error,
     })
 
 
 @app.route('/api/resolve')
 def resolve_metadata():
-    """Keep the metadata path — useful for the downloader's cover/stats."""
+    """Return metadata for a TikTok URL. No video bytes are fetched."""
     url = request.args.get('url')
     if not url:
         return jsonify({'ok': False, 'error': 'missing url parameter'}), 400
