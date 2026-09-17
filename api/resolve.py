@@ -6,16 +6,11 @@ import os
 app = Flask(__name__)
 
 
-@app.route('/')
-@app.route('/api/classify')
-def classify():
-    url = request.args.get('url')
-    if not url:
-        return jsonify({
-            'ok': False,
-            'error': 'missing url parameter. Usage: /api/classify?url=<tiktok_url>'
-        }), 400
-
+# ---------------------------------------------------------------------------
+# Shared classifier
+# ---------------------------------------------------------------------------
+def _classify_one(url):
+    """Classify a single TikTok URL. Returns a dict, never raises."""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -67,7 +62,6 @@ def classify():
             kind = 'video'
             reason = 'yt-dlp extracted a single-item result without /live'
 
-    # Extract the live channel username from the extractor error, when present.
     if extract_error:
         err_lower = extract_error.lower()
 
@@ -83,7 +77,6 @@ def classify():
             kind = 'live'
             reason = 'extractor reported a live channel that is offline'
 
-    # Fall back to inspecting the input URL for obvious cases.
     if kind == 'unknown':
         if re.search(r'/(live|share/live)/', url, re.I):
             kind = 'live'
@@ -92,8 +85,7 @@ def classify():
             kind = 'video'
             reason = 'input URL matches video/photo pattern'
 
-    return jsonify({
-        'ok': True,
+    return {
         'input': url,
         'kind': kind,
         'reason': reason,
@@ -101,9 +93,87 @@ def classify():
         'is_live': live_broadcast,
         'live_username': live_username,
         'error': extract_error,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Single-URL endpoint
+# ---------------------------------------------------------------------------
+@app.route('/')
+@app.route('/api/classify')
+def classify():
+    url = request.args.get('url')
+    if not url:
+        return jsonify({
+            'ok': False,
+            'error': 'missing url parameter. Usage: /api/classify?url=<tiktok_url>'
+        }), 400
+
+    result = _classify_one(url)
+    result['ok'] = True
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Batch endpoint
+# ---------------------------------------------------------------------------
+# Vercel Hobby has a 10-second execution limit. Each yt-dlp call takes
+# ~1-2 s. Cap the batch so we finish comfortably inside the limit.
+BATCH_MAX = 5
+
+
+@app.route('/api/classify-batch', methods=['POST', 'OPTIONS'])
+def classify_batch():
+    # CORS preflight for browser clients.
+    if request.method == 'OPTIONS':
+        return ('', 204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+        })
+
+    payload = request.get_json(silent=True) or {}
+    urls = payload.get('urls') or []
+    if not isinstance(urls, list) or not urls:
+        return jsonify({
+            'ok': False,
+            'error': 'expected JSON body {"urls": ["...", "..."]}'
+        }), 400
+
+    truncated = False
+    if len(urls) > BATCH_MAX:
+        urls = urls[:BATCH_MAX]
+        truncated = True
+
+    results = []
+    for u in urls:
+        if not isinstance(u, str) or not u.strip():
+            results.append({
+                'input': u,
+                'kind': 'unknown',
+                'reason': 'empty url',
+                'resolved_url': '',
+                'is_live': None,
+                'live_username': '',
+                'error': 'empty url',
+            })
+            continue
+        results.append(_classify_one(u.strip()))
+
+    response = jsonify({
+        'ok': True,
+        'count': len(results),
+        'truncated': truncated,
+        'batch_max': BATCH_MAX,
+        'results': results,
     })
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
 
+# ---------------------------------------------------------------------------
+# Metadata endpoint (unchanged)
+# ---------------------------------------------------------------------------
 @app.route('/api/resolve')
 def resolve_metadata():
     """Return metadata for a TikTok URL. No video bytes are fetched."""
