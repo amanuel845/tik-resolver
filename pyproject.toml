@@ -7,10 +7,5 @@ dependencies = [
     "yt-dlp",
 ]
 
-[[tool.vercel.entrypoints]]
-path = "api/resolve"
-entrypoint = "app"
-
-[[tool.vercel.entrypoints]]
-path = "api/download"
-entrypoint = "app"
+[tool.vercel]
+entrypoint = "api.resolve:app"
